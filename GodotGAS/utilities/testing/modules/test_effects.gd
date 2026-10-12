@@ -391,10 +391,11 @@ func _battery_attribute_aggregation() -> void:
 	var instant := _aggregation_effect(GameplayEffectModifier.Operation.ADD, 20.0, &"Test.Instant")
 	instant.policy = GameplayEffect.DurationPolicy.INSTANT
 	asc.apply_gameplay_effect(instant)
-	assert_approx(asc.get_attribute("health").base_value, 120.0, 0.0001, "6.07: Instant effect changes base")
-	assert_approx(asc.get_attribute("health").current_value, 60.0, 0.0001, "6.08: Active effect aggregates over new base")
+	assert_approx(asc.get_attribute("health").base_value, 100.0, 0.0001, "6.07: Instant effect leaves base_value untouched")
+	assert_approx(asc.get_attribute("health").get_working_base(), 120.0, 0.0001, "6.07a: Instant effect updates working base via runtime_delta")
+	assert_approx(asc.get_attribute("health").current_value, 60.0, 0.0001, "6.08: Active effect aggregates over new working base")
 	asc.remove_effects_with_tag(&"Test.Multiply")
-	assert_approx(asc.get_attribute("health").current_value, 120.0, 0.0001, "6.09: Removing buff exposes changed base")
+	assert_approx(asc.get_attribute("health").current_value, 120.0, 0.0001, "6.09: Removing buff exposes changed working base")
 	asc.queue_free()
 
 	var combined_asc := AbilitySystemComponent.new()

@@ -202,7 +202,7 @@ func _battery_2_costs_cooldowns_and_queries() -> void:
 	
 	asc.queue_free()
 
-	# Cost prediction uses the prospective base plus active modifiers.
+	# Cost prediction uses the prospective working base plus active modifiers.
 	var buffed_asc := AbilitiesTestASC.new()
 	buffed_asc.attribute_sets.append(AbilitiesAttributeSet.new())
 	add_child(buffed_asc)
@@ -216,9 +216,10 @@ func _battery_2_costs_cooldowns_and_queries() -> void:
 	buffed_asc.apply_gameplay_effect(buff_effect)
 	assert_true(buffed_asc.can_afford_cost(cost_ef), "2.10: Cost prediction accounts for active multiplier")
 	buffed_asc.apply_gameplay_effect(cost_ef)
-	assert_eq(buffed_asc.get_attribute("mana").base_value, 40.0, "2.11: Cost deducts from base")
-	assert_eq(buffed_asc.get_attribute("mana").current_value, 20.0, "2.12: Active multiplier applies to remaining base")
-	assert_false(buffed_asc.can_afford_cost(cost_ef), "2.13: Cost rejects insufficient remaining base")
+	assert_eq(buffed_asc.get_attribute("mana").base_value, 100.0, "2.11: Cost leaves base_value untouched at 100.0")
+	assert_eq(buffed_asc.get_attribute("mana").get_working_base(), 40.0, "2.11a: Cost deducts from working base via runtime_delta")
+	assert_eq(buffed_asc.get_attribute("mana").current_value, 20.0, "2.12: Active multiplier applies to remaining working base")
+	assert_false(buffed_asc.can_afford_cost(cost_ef), "2.13: Cost rejects insufficient remaining working base")
 	var persistent_cost := GameplayEffect.new()
 	persistent_cost.policy = GameplayEffect.DurationPolicy.INFINITE
 	var persistent_cost_mod := GameplayEffectModifier.new()
@@ -235,7 +236,7 @@ func _battery_2_costs_cooldowns_and_queries() -> void:
 	override_effect.policy = GameplayEffect.DurationPolicy.INFINITE
 	override_effect.modifiers.append(override_mod)
 	buffed_asc.apply_gameplay_effect(override_effect)
-	assert_false(buffed_asc.can_afford_cost(cost_ef), "2.15: Override cannot conceal insufficient base resources")
+	assert_false(buffed_asc.can_afford_cost(cost_ef), "2.15: Override cannot conceal insufficient working base resources")
 	buffed_asc.queue_free()
 
 

@@ -1,7 +1,8 @@
 ## Self-contained exhaustive test suite for the GodotGAS Attributes Subsystem.
 ##
 ## Tests AttributeData initialization, deep-cloning memory isolation,
-## pre/post attribute pipelines, clamping goalposts, and dynamic overrides.
+## pre/post attribute pipelines, clamping goalposts, dynamic overrides,
+## and respawn pooling via runtime_delta and reinitialize().
 ##
 ## @meta_addon: GodotGAS
 ## @meta_author: YulRun (https://YulRun.Dev)
@@ -62,6 +63,7 @@ func run_all_tests() -> void:
 	await _battery_pre_change_clamping()
 	await _battery_post_change_goalposts()
 	await _battery_dynamic_overrides()
+	await _battery_respawn_and_reinitialize()
 	
 	print_summary()
 
@@ -88,16 +90,19 @@ func _battery_attribute_data_core() -> void:
 	var data := AttributeData.new(100.0)
 	assert_eq(data.base_value, 100.0, "1.01: AttributeData initializes base_value correctly")
 	assert_eq(data.current_value, 100.0, "1.02: AttributeData initializes current_value to base_value")
+	assert_eq(data.runtime_delta, 0.0, "1.02a: AttributeData initializes runtime_delta to 0.0")
 	
 	# Current value divergence
 	data.current_value = 65.0
 	assert_eq(data.current_value, 65.0, "1.03: current_value can mutate independently")
 	assert_eq(data.base_value, 100.0, "1.04: base_value remains unchanged when current_value mutates")
+	assert_eq(data.runtime_delta, -35.0, "1.04a: Direct write to current_value synchronizes runtime_delta")
 	
 	# Base value setter synchronization
 	data.base_value = 150.0
 	assert_eq(data.base_value, 150.0, "1.05: base_value updated via setter")
 	assert_eq(data.current_value, 150.0, "1.06: current_value automatically synced when base_value changes")
+	assert_eq(data.runtime_delta, 0.0, "1.06a: Updating base_value resets runtime_delta to 0.0")
 	
 	# Zero and negative handling
 	var negative_data := AttributeData.new(-25.0)
@@ -136,6 +141,7 @@ func _battery_memory_isolation_and_cloning() -> void:
 	# Mutate Entity A
 	asc_a._apply_attribute_change("health", -40.0)
 	assert_eq(asc_a.get_attribute("health").current_value, 60.0, "2.04: Entity A health modified to 60.0")
+	assert_eq(asc_a.get_attribute("health").base_value, 100.0, "2.04a: Entity A base_value remains untouched at 100.0")
 	assert_eq(asc_b.get_attribute("health").current_value, 100.0, "2.05: Entity B health unaffected by Entity A damage")
 	assert_eq(shared_template.health.current_value, 100.0, "2.06: Original template resource completely untouched")
 	
@@ -186,7 +192,7 @@ func _battery_memory_isolation_and_cloning() -> void:
 	asc_c.remove_effects_with_tag(&"Test.SharedAdd")
 	assert_approx(shared_set.health.current_value, 75.0, 0.0001, "2.11: Removing one ASC effect preserves the other's modifier")
 	asc_d.remove_effects_with_tag(&"Test.SharedMultiply")
-	assert_approx(shared_set.health.current_value, 150.0, 0.0001, "2.12: Removing both ASC effects restores shared base")
+	assert_approx(shared_set.health.current_value, 150.0, 0.0001, "2.12: Removing both ASC effects restores shared working base")
 	
 	asc_c.queue_free()
 	asc_d.queue_free()
@@ -256,9 +262,10 @@ func _battery_pre_change_clamping() -> void:
 	assert_eq(delta_3, 0.0, "4.11: Applying damage at 0.0 returns 0.0 actual delta")
 	assert_eq(asc.get_attribute("health").current_value, 0.0, "4.12: Health remains at 0.0")
 	assert_eq(_attr_changes.size(), 0, "4.13: attribute_changed NOT emitted when final_value == old_value")
-	assert_eq(asc.get_attribute("health").base_value, 0.0, "4.13a: Clamped damage does not push base below zero")
+	assert_eq(asc.get_attribute("health").base_value, 100.0, "4.13a: Fatal damage leaves base_value untouched at 100.0")
+	assert_eq(asc.get_attribute("health").get_working_base(), 0.0, "4.13b: Clamped damage does not push working base below zero")
 	asc._apply_attribute_change("health", 10.0)
-	assert_eq(asc.get_attribute("health").current_value, 10.0, "4.13b: Small heal works after over-damage")
+	assert_eq(asc.get_attribute("health").current_value, 10.0, "4.13c: Small heal works after over-damage")
 	asc._apply_attribute_change("health", -10.0)
 	
 	# Over-heal clamp to max_health (100.0)
@@ -358,5 +365,78 @@ func _battery_dynamic_overrides() -> void:
 	var empty_dict: Dictionary[String, float] = {}
 	asc.initialize_attribute_overrides(empty_dict)
 	assert_eq(_attr_changes.size(), 0, "6.07: Empty overrides dictionary safely completes without action")
+	
+	asc.queue_free()
+
+
+# ---------------------------------------------------------
+# Battery 7: Respawn Pooling, Manual Reset, and reinitialize()
+# ---------------------------------------------------------
+func _battery_respawn_and_reinitialize() -> void:
+	print_rich("\n[color=yellow]--- Battery 7: Respawn Pooling & reinitialize() ---[/color]")
+	
+	var asc := AbilitySystemComponent.new()
+	asc.name = "RespawnASC"
+	asc.attribute_sets.append(MockClampingAttributeSet.new())
+	asc.attribute_changed.connect(_on_attribute_changed)
+	add_child(asc)
+	
+	# 1. Deal fatal Instant GameplayEffect damage (-100 HP)
+	var dmg_mod := GameplayEffectModifier.new()
+	dmg_mod.attribute_name = "health"
+	dmg_mod.operation = GameplayEffectModifier.Operation.ADD
+	dmg_mod.magnitude = -100.0
+	var dmg_effect := GameplayEffect.new()
+	dmg_effect.policy = GameplayEffect.DurationPolicy.INSTANT
+	dmg_effect.modifiers.append(dmg_mod)
+	
+	asc.apply_gameplay_effect(dmg_effect)
+	var health_attr := asc.get_attribute("health")
+	assert_eq(health_attr.current_value, 0.0, "7.01: Fatal instant damage drops current_value to 0.0")
+	assert_eq(health_attr.base_value, 100.0, "7.02: Fatal instant damage preserves base_value at 100.0")
+	assert_eq(health_attr.runtime_delta, -100.0, "7.03: Fatal instant damage records -100.0 in runtime_delta")
+	
+	# 2. Manual user respawn pattern: current_value = base_value
+	health_attr.current_value = health_attr.base_value
+	assert_eq(health_attr.current_value, 100.0, "7.04: Manual respawn restores current_value to 100.0")
+	assert_eq(health_attr.runtime_delta, 0.0, "7.05: Manual respawn setter automatically clears runtime_delta")
+	
+	# Verify subsequent damage does not collapse back to 0.0
+	var chip_mod := GameplayEffectModifier.new()
+	chip_mod.attribute_name = "health"
+	chip_mod.operation = GameplayEffectModifier.Operation.ADD
+	chip_mod.magnitude = -15.0
+	var chip_effect := GameplayEffect.new()
+	chip_effect.policy = GameplayEffect.DurationPolicy.INSTANT
+	chip_effect.modifiers.append(chip_mod)
+	asc.apply_gameplay_effect(chip_effect)
+	assert_eq(health_attr.current_value, 85.0, "7.06: Post-respawn damage calculates cleanly from restored 100.0")
+	
+	# 3. Full reinitialize() lifecycle with cached overrides and active effects
+	var init_overrides: Dictionary[String, float] = {
+		"shield": 50.0
+	}
+	asc.initialize_attribute_overrides(init_overrides)
+	assert_eq(asc.get_attribute("shield").current_value, 50.0, "7.07: Initial override sets shield to 50.0")
+	
+	# Apply an infinite debuff, a manual tag, and deal fatal damage + strip shield
+	var debuff := GameplayEffect.new()
+	debuff.policy = GameplayEffect.DurationPolicy.INFINITE
+	debuff.granted_tags = [&"Status.Debuff.Poison"]
+	asc.apply_gameplay_effect(debuff)
+	asc.add_tag(&"State.Dead")
+	asc._apply_attribute_change("shield", -50.0)
+	asc.apply_gameplay_effect(dmg_effect)
+	
+	assert_eq(health_attr.current_value, 0.0, "7.08: Enemy health at 0.0 before reinitialize()")
+	assert_eq(asc.get_attribute("shield").current_value, 0.0, "7.09: Enemy shield at 0.0 before reinitialize()")
+	assert_true(asc.has_tag(&"Status.Debuff.Poison"), "7.10: Debuff tag active before reinitialize()")
+	
+	# Execute reinitialize()
+	asc.reinitialize()
+	assert_eq(health_attr.current_value, 100.0, "7.11: reinitialize() restores health to base_value (100.0)")
+	assert_eq(asc.get_attribute("shield").current_value, 50.0, "7.12: reinitialize() re-applies cached shield override (50.0)")
+	assert_false(asc.has_tag(&"Status.Debuff.Poison"), "7.13: reinitialize() purges active effects and their granted tags")
+	assert_false(asc.has_tag(&"State.Dead"), "7.14: reinitialize() clears manual tags")
 	
 	asc.queue_free()

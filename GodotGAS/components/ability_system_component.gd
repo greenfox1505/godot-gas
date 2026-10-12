@@ -42,7 +42,7 @@ signal active_effect_removed(active_effect: ActiveGameplayEffect)
 ## The payload dictionary contains context (e.g., {"tags": [array of blocking tags]}).
 signal ability_activation_failed(ability: GameplayAbility, reason: ActivationError, payload: Dictionary)
 
-## Fired when THIS ASC receives an effect from someone else. 
+## Fired when THIS ASC receives an effect from someone else.
 ## UI listens to this to spawn Damage Numbers, "Miss!", or "Blocked!" text.
 signal effect_received(source_asc: AbilitySystemComponent, spec: GameplayEffectSpec)
 
@@ -84,6 +84,9 @@ var _active_tags: Dictionary = {}
 
 ## Array tracking all active gameplay effects currently applied to this component.
 var _active_effects: Array[ActiveGameplayEffect] = []
+
+## Cached dictionary of initial attribute overrides for seamless reinitialization on respawn.
+var _initial_attribute_overrides: Dictionary[String, float] = {}
 
 ## Recursion-guard flags to safely cascade suppression evaluations when tags change.
 var _is_evaluating_suppression: bool = false
@@ -128,6 +131,7 @@ func _ready() -> void:
 					if prop.class_name == &"AttributeData":
 						rep_config.add_property(NodePath(set_path + ":" + prop.name + ":current_value"))
 						rep_config.add_property(NodePath(set_path + ":" + prop.name + ":base_value"))
+						rep_config.add_property(NodePath(set_path + ":" + prop.name + ":runtime_delta"))
 		
 		sync.replication_config = rep_config
 		add_child(sync)
@@ -170,7 +174,7 @@ func _process(delta: float) -> void:
 						
 					# 3. Re-Evaluate and Apply the math natively
 					# Doing this per tick allows DoTs to dynamically update if attacker stats change!
-					_evaluate_spec(active_effect.spec) 
+					_evaluate_spec(active_effect.spec)
 					_commit_spec_math(active_effect.spec)
 				
 				# Reset the clock for the next tick
@@ -212,6 +216,37 @@ func advance_turn() -> void:
 			# 3. Check for expiration
 			if spec.remaining_turns <= 0:
 				remove_active_effect(active_effect)
+
+
+## Resets the ASC for object pooling or respawning while keeping granted abilities and AttributeSets intact.
+## Aborts active abilities, purges active effects and tags, resets attributes to base_value, and re-applies overrides.
+func reinitialize(new_overrides: Dictionary[String, float] = {}) -> void:
+	# 1. Forcefully abort any mid-cast abilities without un-granting them
+	for ability in _active_abilities:
+		if ability.is_active:
+			ability.abort_ability()
+			
+	# 2. Purge all active effects (buffs, debuffs, DoTs, cooldowns)
+	for i in range(_active_effects.size() - 1, -1, -1):
+		remove_active_effect(_active_effects[i])
+		
+	# 3. Clear any remaining manual tags and emit removal signals
+	var remaining_tags: Array = _active_tags.keys()
+	for tag in remaining_tags:
+		clear_tag(StringName(tag))
+		
+	# 4. Clear held input state
+	_active_inputs.clear()
+	
+	# 5. Reset all attributes to their unmutated base_value
+	reset_attributes()
+	
+	# 6. Re-apply initial or newly provided stat overrides
+	if not new_overrides.is_empty():
+		_initial_attribute_overrides = new_overrides.duplicate()
+		
+	if not _initial_attribute_overrides.is_empty():
+		initialize_attribute_overrides(_initial_attribute_overrides)
 
 
 ## Safely halts all abilities, removes all active effects, and clears internal state.
@@ -268,7 +303,7 @@ func execute_cue(tag: StringName, payload: Dictionary = {}) -> void:
 
 ## Physically executes the cue locally.
 func _execute_local_cue(tag: StringName, payload: Dictionary = {}) -> void:
-	# We pass get_parent() as the target. 
+	# We pass get_parent() as the target.
 	# This ensures the visual cue attaches to the Character/Enemy, not the ASC node itself.
 	GameplayCueManager.execute_cue(tag, get_parent(), payload)
 #endregion
@@ -337,7 +372,7 @@ func can_activate_ability(ability: GameplayAbility, emit_failure: bool = false) 
 	
 	# 2. Check Activation Query
 	if ability.activation_query and not ability.activation_query.matches(self):
-		if emit_failure: 
+		if emit_failure:
 			ability_activation_failed.emit(ability, ActivationError.FAILED_QUERY, {"query": ability.activation_query})
 		return false
 	
@@ -357,7 +392,7 @@ func check_ability_cooldown(ability: GameplayAbility, emit_failure: bool = false
 	if ability and ability.has_method("get_cooldown_tags"):
 		var cooldown_tags = ability.get_cooldown_tags()
 		if has_any_tags(cooldown_tags):
-			if emit_failure: 
+			if emit_failure:
 				ability_activation_failed.emit(ability, ActivationError.ON_COOLDOWN, {"tags": cooldown_tags})
 			return false
 	return true
@@ -366,7 +401,7 @@ func check_ability_cooldown(ability: GameplayAbility, emit_failure: bool = false
 ## Evaluates only the resource cost requirement of a given ability against this ASC.
 func check_ability_cost(ability: GameplayAbility, emit_failure: bool = false) -> bool:
 	if ability and ability.cost_effect and not can_afford_cost(ability.cost_effect, ability.ability_level):
-		if emit_failure: 
+		if emit_failure:
 			ability_activation_failed.emit(ability, ActivationError.INSUFFICIENT_RESOURCES, {"effect": ability.cost_effect})
 		return false
 	return true
@@ -411,7 +446,7 @@ func can_afford_cost(effect: GameplayEffect, effect_level: float = 1.0) -> bool:
 	return true
 
 
-## Cancels any currently running abilities that possess the given tags, 
+## Cancels any currently running abilities that possess the given tags,
 ## or are blocked by the given tags.
 func cancel_abilities_with_tags(tags: Array[StringName]) -> void:
 	for ability in _active_abilities:
@@ -419,15 +454,15 @@ func cancel_abilities_with_tags(tags: Array[StringName]) -> void:
 			continue
 			
 		for tag in tags:
-			# Support hierarchical cancellation 
+			# Support hierarchical cancellation
 			if ability.ability_tag == tag or String(ability.ability_tag).begins_with(String(tag) + "."):
 				ability.abort_ability()
-				break 
+				break
 				
 			if ability.activation_query:
 				if tag in ability.activation_query.ignore_tags or tag in ability.activation_query.ignore_exact_tags:
 					ability.abort_ability()
-					break 
+					break
 
 
 ## Attempts to activate all granted abilities that match the given tag.
@@ -451,7 +486,7 @@ func try_activate_abilities_by_tag(tag: StringName, event_payload: Variant = nul
 ## Retrieves an AttributeData resource by its string name.
 func get_attribute(attribute_name: String) -> AttributeData:
 	for set in attribute_sets:
-		if attribute_name in set: 
+		if attribute_name in set:
 			var found_attr = set.get(attribute_name)
 			if found_attr is AttributeData:
 				return found_attr
@@ -468,14 +503,30 @@ func has_attribute(attribute_name: String) -> bool:
 	return false
 
 
-## Change the permanent base and then derive current from active effects.
+## Resets all attributes in all attached AttributeSets back to their base_value,
+## clearing accumulated runtime_delta offsets and re-evaluating any remaining active effects.
+func reset_attributes() -> void:
+	for set in attribute_sets:
+		if not set:
+			continue
+		for prop in set.get_property_list():
+			if prop.class_name == &"AttributeData":
+				var attr: AttributeData = set.get(prop.name)
+				if attr:
+					var old_value: float = attr.current_value
+					attr.reset()
+					_recalculate_attribute(prop.name, null, old_value)
+
+
+## Change the working base (base_value + runtime_delta) and derive current from active effects.
 func _apply_attribute_change(attribute_name: String, amount: float, spec: GameplayEffectSpec = null) -> float:
 	for set in attribute_sets:
-		if attribute_name in set: 
+		if attribute_name in set:
 			var attr = set.get(attribute_name)
 			if attr is AttributeData:
 				var old_value: float = attr.current_value
-				attr.base_value = set.pre_attribute_change(attribute_name, attr.base_value + amount)
+				var clamped_working_base: float = set.pre_attribute_change(attribute_name, attr.get_working_base() + amount)
+				attr.set_working_base(clamped_working_base)
 				_recalculate_attribute(attribute_name, spec, old_value)
 				return attr.current_value - old_value
 				
@@ -560,9 +611,9 @@ func _recalculate_attribute(attribute_name: String, spec: GameplayEffectSpec = n
 		return 0.0
 
 	var old_value: float = attr.current_value if old_value_override == null else float(old_value_override)
-	var aggregate := _aggregate_attribute_value(attribute_name, attr.base_value)
+	var aggregate := _aggregate_attribute_value(attribute_name, attr.get_working_base())
 	var final_value := attribute_set.pre_attribute_change(attribute_name, aggregate)
-	attr.current_value = final_value
+	attr._set_current_value_internal(final_value)
 	if not is_equal_approx(old_value, final_value):
 		attribute_changed.emit(attribute_name, old_value, final_value, spec)
 		attribute_set.post_attribute_change(self, attribute_name, old_value, final_value)
@@ -588,6 +639,8 @@ func _recalculate_effect(active_effect: ActiveGameplayEffect, spec: GameplayEffe
 func initialize_attribute_overrides(overrides: Dictionary[String, float]) -> void:
 	if overrides.is_empty():
 		return
+		
+	_initial_attribute_overrides = overrides.duplicate()
 		
 	# Dynamically generate an Instant Effect
 	var init_effect: GameplayEffect = GameplayEffect.new()
@@ -715,7 +768,7 @@ func _apply_effect_spec(spec: GameplayEffectSpec) -> ActiveGameplayEffect:
 					
 					# We found it! Reset its clock back to full based on the dynamically altered Spec!
 					if effect.policy == GameplayEffect.DurationPolicy.DURATION:
-						active_effect.time_remaining = spec.duration 
+						active_effect.time_remaining = spec.duration
 					elif effect.policy == GameplayEffect.DurationPolicy.TURN_BASED:
 						active_effect.spec.remaining_turns = spec.remaining_turns
 					
@@ -781,7 +834,7 @@ func _execute_instant_spec(spec: GameplayEffectSpec) -> ActiveGameplayEffect:
 ## Returns the persistent ActiveGameplayEffect stored in memory.
 func _execute_active_spec(spec: GameplayEffectSpec) -> ActiveGameplayEffect:
 	# Note: Initializes using the dynamic 'spec' variable, not the static 'effect_def' variable!
-	var active_effect = ActiveGameplayEffect.new(spec) 
+	var active_effect = ActiveGameplayEffect.new(spec)
 	var effect = spec.effect_def
 	
 	# 1. Trigger Application Cues
@@ -981,7 +1034,7 @@ func _evaluate_spec(spec: GameplayEffectSpec) -> void:
 		})
 		
 	# Cost checks need the same prospective current value that commit would
-	# produce from the changed base. Persistent effects fill this after insertion.
+	# produce from the changed working base. Persistent effects fill this after insertion.
 	if effect.policy == GameplayEffect.DurationPolicy.INSTANT or spec.period > 0.0:
 		var base_targets := _calculate_base_targets(spec)
 		for attr_name in base_targets:
@@ -993,7 +1046,7 @@ func _evaluate_spec(spec: GameplayEffectSpec) -> void:
 		for attr_name in _affected_attributes(spec):
 			var attr := get_attribute(attr_name)
 			if attr != null:
-				spec.calculated_deltas[attr_name] = _aggregate_attribute_value(attr_name, attr.base_value, spec) - attr.current_value
+				spec.calculated_deltas[attr_name] = _aggregate_attribute_value(attr_name, attr.get_working_base(), spec) - attr.current_value
 
 
 func _calculate_base_targets(spec: GameplayEffectSpec) -> Dictionary:
@@ -1001,13 +1054,13 @@ func _calculate_base_targets(spec: GameplayEffectSpec) -> Dictionary:
 	for attr_name in spec.execution_deltas:
 		var attr := get_attribute(attr_name)
 		if attr != null:
-			base_targets[attr_name] = attr.base_value + float(spec.execution_deltas[attr_name])
+			base_targets[attr_name] = attr.get_working_base() + float(spec.execution_deltas[attr_name])
 	for modifier in spec.evaluated_modifiers:
 		var attr_name: String = modifier["attribute"]
 		var attr := get_attribute(attr_name)
 		if attr == null:
 			continue
-		var value: float = base_targets.get(attr_name, attr.base_value)
+		var value: float = base_targets.get(attr_name, attr.get_working_base())
 		var magnitude: float = modifier["magnitude"]
 		match modifier["operation"]:
 			GameplayEffectModifier.Operation.ADD:
@@ -1025,7 +1078,7 @@ func _calculate_base_targets(spec: GameplayEffectSpec) -> Dictionary:
 	return base_targets
 
 
-## Commit instant or periodic math to the permanent base, then reaggregate.
+## Commit instant or periodic math to the working base (runtime_delta), then reaggregate.
 func _commit_spec_math(spec: GameplayEffectSpec) -> Dictionary:
 	var final_clamped_deltas: Dictionary = {}
 	if not spec:
@@ -1038,7 +1091,7 @@ func _commit_spec_math(spec: GameplayEffectSpec) -> Dictionary:
 			if attr_name in attribute_set and attribute_set.get(attr_name) == attr:
 				base_targets[attr_name] = attribute_set.pre_attribute_change(attr_name, float(base_targets[attr_name]))
 				break
-		attr.base_value = float(base_targets[attr_name])
+		attr.set_working_base(float(base_targets[attr_name]))
 		var actual_change := _recalculate_attribute(attr_name, spec, old_value)
 		if not is_zero_approx(actual_change):
 			final_clamped_deltas[attr_name] = actual_change
@@ -1065,7 +1118,7 @@ func add_tag(tag: StringName) -> void:
 
 ## Decrements the reference count of a given tag, removing it if it reaches 0.
 func remove_tag(tag: StringName) -> void:
-	if not _active_tags.has(tag): 
+	if not _active_tags.has(tag):
 		return
 		
 	_active_tags[tag] -= 1
@@ -1204,7 +1257,7 @@ func _trigger_effect_events(spec: GameplayEffectSpec) -> void:
 		send_gameplay_event(dynamic_tag, spec)
 
 
-## Sends a global event to this ASC. If any granted abilities are listening for this tag, 
+## Sends a global event to this ASC. If any granted abilities are listening for this tag,
 ## they will attempt to activate and receive the payload.
 func send_gameplay_event(event_tag: StringName, payload: Variant = null) -> void:
 	if event_tag == "":
@@ -1275,6 +1328,7 @@ func _debug_active_effect_added(active_effect: ActiveGameplayEffect) -> void:
 	var effect_name = _get_debug_spec_name(active_effect.spec)
 	var duration = active_effect.spec.duration if active_effect.spec.duration > 0.0 else "Infinite"
 	print_rich("[color=gray]> (DEBUG)[/color] [color=cyan]<%s>[/color] signal [color=orange][active_effect_added][/color] added [color=green]'%s'[/color] with duration [color=yellow]%s[/color]s" % [self.get_parent().name, effect_name, duration])
+
 
 func _debug_active_effect_removed(active_effect: ActiveGameplayEffect) -> void:
 	var effect_name = _get_debug_spec_name(active_effect.spec)
