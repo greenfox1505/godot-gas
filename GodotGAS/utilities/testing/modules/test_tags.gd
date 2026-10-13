@@ -1,7 +1,8 @@
 ## Self-contained exhaustive test suite for the GodotGAS Tag Subsystem.
 ##
 ## Tests reference counting, hierarchical inheritance, exact matching,
-## signal dispatch, and full GameplayTagQuery rule variations.
+## signal dispatch, full GameplayTagQuery rule variations, and Registry 
+## smart pruning/auto-healing.
 ##
 ## @meta_addon: GodotGAS
 ## @meta_author: YulRun (https://YulRun.Dev)
@@ -34,6 +35,7 @@ func run_all_tests() -> void:
 	await _battery_hierarchical_lookups(asc)
 	await _battery_tag_queries(asc)
 	await _battery_tag_edge_cases(asc)
+	await _battery_registry_hierarchy_and_pruning()
 	
 	print_summary()
 	asc.queue_free()
@@ -244,3 +246,42 @@ func _battery_tag_edge_cases(asc: AbilitySystemComponent) -> void:
 	# Empty query matches empty ASC
 	var empty_query := GameplayTagQuery.new()
 	assert_true(empty_query.matches(asc), "4.04: Empty tag query matches an empty ASC without constraints")
+
+
+# ---------------------------------------------------------
+# Battery 5: Registry Hierarchy & Smart Pruning
+# ---------------------------------------------------------
+func _battery_registry_hierarchy_and_pruning() -> void:
+	print_rich("\n[color=yellow]--- Battery 5: Registry Hierarchy & Smart Pruning ---[/color]")
+
+	# Use an isolated registry so we don't mess with the project's actual tags
+	var reg := GameplayTagRegistry.new()
+	
+	# 1. Hierarchical Addition
+	reg.add_tag("Test.A.B")
+	assert_true(reg.has_tag(&"Test"), "5.01: add_tag automatically explicitly registers the root parent")
+	assert_true(reg.has_tag(&"Test.A"), "5.02: add_tag automatically explicitly registers the mid-parent")
+	assert_true(reg.has_tag(&"Test.A.B"), "5.03: add_tag registers the exact leaf tag")
+	
+	# 2. Smart Pruning (Upward Sweep)
+	reg.add_tag("Test.A.C")
+	reg.remove_tag(&"Test.A.B")
+	assert_false(reg.has_tag(&"Test.A.B"), "5.04: remove_tag deleted the exact leaf")
+	assert_true(reg.has_tag(&"Test.A"), "5.05: Upward sweep spared parent 'Test.A' because sibling 'Test.A.C' exists")
+	
+	reg.remove_tag(&"Test.A.C")
+	assert_false(reg.has_tag(&"Test.A"), "5.06: Upward sweep deleted parent 'Test.A' because it became empty")
+	assert_false(reg.has_tag(&"Test"), "5.07: Upward sweep recursively deleted root 'Test' because it became empty")
+	
+	# 3. Downward Sweep
+	reg.add_tag("Sweep.Down.Target")
+	reg.remove_tag(&"Sweep")
+	assert_false(reg.has_tag(&"Sweep"), "5.08: Downward sweep deleted the parent")
+	assert_false(reg.has_tag(&"Sweep.Down.Target"), "5.09: Downward sweep recursively deleted all children")
+	
+	# 4. Auto-Heal (validate_tag_hierarchy)
+	reg.tags.clear()
+	reg.tags.append(&"Heal.Broken.Chain")
+	reg.validate_tag_hierarchy()
+	assert_true(reg.has_tag(&"Heal"), "5.10: validate_tag_hierarchy safely injected missing root")
+	assert_true(reg.has_tag(&"Heal.Broken"), "5.11: validate_tag_hierarchy safely injected missing mid-parent")

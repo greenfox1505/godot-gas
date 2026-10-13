@@ -65,6 +65,10 @@ func _load_registry() -> void:
 	var tag_registry_path = GodotGasProjectSettings.get_registry_tag_path()
 	if ResourceLoader.exists(tag_registry_path):
 		_registry = load(tag_registry_path) as GameplayTagRegistry
+		
+		# [NEW] Auto-heal the hierarchy on load!
+		if _registry:
+			_registry.validate_tag_hierarchy()
 	else:
 		if not Engine.is_editor_hint() or EditorInterface.is_plugin_enabled("GodotGAS"):
 			push_warning("GodotGAS: Tag Registry not found at " + tag_registry_path)
@@ -287,8 +291,17 @@ func _on_tree_button_clicked(item: TreeItem, _column: int, id: int, _mouse_butto
 	if id == 0: 
 		var tag_val = item.get_metadata(0)
 		if tag_val != null:
-			_tag_to_delete = tag_val
-			_delete_confirm_dialog.dialog_text = "Are you sure you want to delete the tag:\n'%s'?" % _tag_to_delete
+			_tag_to_delete = StringName(tag_val)
+			
+			if _registry:
+				var children_count = _registry.get_child_tags(_tag_to_delete).size()
+				if children_count > 0:
+					_delete_confirm_dialog.dialog_text = "Are you sure you want to delete the tag:\n'%s'?\n\n[WARNING] This will also permanently delete %d child tag(s)." % [_tag_to_delete, children_count]
+				else:
+					_delete_confirm_dialog.dialog_text = "Are you sure you want to delete the tag:\n'%s'?" % _tag_to_delete
+			else:
+				_delete_confirm_dialog.dialog_text = "Are you sure you want to delete the tag:\n'%s'?" % _tag_to_delete
+				
 			_delete_confirm_dialog.popup_centered()
 
 
